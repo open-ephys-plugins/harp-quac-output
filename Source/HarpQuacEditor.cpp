@@ -63,7 +63,7 @@ HarpQuacEditor::HarpQuacEditor (GenericProcessor* p)
     waveformSelector->setBounds (235, 29, 70, 20);
     waveformSelector->addItem ("Pulse", (int) PatternType::pulse + 1);
     waveformSelector->addItem ("Sine", (int) PatternType::sine + 1);
-    waveformSelector->addItem ("Custom", (int) PatternType::custom + 1);
+    //waveformSelector->addItem ("Custom", (int) PatternType::custom + 1);
     waveformSelector->setSelectedId ((int) PatternType::pulse + 1, dontSendNotification);
     waveformSelector->addListener (this);
     addAndMakeVisible (waveformSelector.get());
