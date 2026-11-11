@@ -69,6 +69,13 @@ public:
     Device& operator=(const Device&) = delete;
 
     uint16_t who_am_i() const;
+    struct TransactionTiming {
+        double write_ms = 0;
+        double reply_ms = 0;
+    };
+
+    // Host-side timing of the last successful transaction, not hardware onset.
+    TransactionTiming last_transaction_timing() const;
 
     template <class T>
     Reply<T> read(Register<T> reg) {

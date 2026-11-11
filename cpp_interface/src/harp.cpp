@@ -91,31 +91,57 @@ std::optional<RawMessage> pop_frame(std::vector<uint8_t>& buf) {
 }
 
 #ifdef _WIN32
+class OverlappedOperation {
+public:
+    OverlappedOperation() {
+        operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!operation.hEvent) throw Error("failed to create serial I/O event");
+    }
+
+    ~OverlappedOperation() { CloseHandle(operation.hEvent); }
+    OverlappedOperation(const OverlappedOperation&) = delete;
+    OverlappedOperation& operator=(const OverlappedOperation&) = delete;
+    void reset() {
+        const HANDLE event = operation.hEvent;
+        operation = {};
+        operation.hEvent = event;
+        ResetEvent(event);
+    }
+
+    OVERLAPPED operation{};
+};
 class SerialPort {
 public:
     explicit SerialPort(const std::string& port) {
         std::string path = port.rfind("\\\\.\\", 0) == 0 ? port : "\\\\.\\" + port;
-        handle_ = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        handle_ = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) throw Error("failed to open " + port);
+        try {
+            DCB dcb{};
+            dcb.DCBlength = sizeof(dcb);
+            if (!GetCommState(handle_, &dcb)) throw Error("GetCommState failed");
+            dcb.BaudRate = 1000000;
+            dcb.ByteSize = 8;
+            dcb.Parity = NOPARITY;
+            dcb.StopBits = ONESTOPBIT;
+            dcb.fDtrControl = DTR_CONTROL_ENABLE;
+            dcb.fRtsControl = RTS_CONTROL_ENABLE;
+            if (!SetCommState(handle_, &dcb)) throw Error("SetCommState failed");
 
-        DCB dcb{};
-        dcb.DCBlength = sizeof(dcb);
-        if (!GetCommState(handle_, &dcb)) throw Error("GetCommState failed");
-        dcb.BaudRate = 1000000;
-        dcb.ByteSize = 8;
-        dcb.Parity = NOPARITY;
-        dcb.StopBits = ONESTOPBIT;
-        dcb.fDtrControl = DTR_CONTROL_ENABLE;
-        dcb.fRtsControl = RTS_CONTROL_ENABLE;
-        if (!SetCommState(handle_, &dcb)) throw Error("SetCommState failed");
-
-        COMMTIMEOUTS timeouts{};
-        timeouts.ReadIntervalTimeout = 20;
-        timeouts.ReadTotalTimeoutConstant = 20;
-        timeouts.ReadTotalTimeoutMultiplier = 0;
-        timeouts.WriteTotalTimeoutConstant = 1000;
-        if (!SetCommTimeouts(handle_, &timeouts)) throw Error("SetCommTimeouts failed");
-        PurgeComm(handle_, PURGE_RXCLEAR | PURGE_TXCLEAR);
+            COMMTIMEOUTS timeouts{};
+            // Return buffered bytes immediately, or wait only for the first
+            // byte. The idle timeout bounds the reader's shutdown latency.
+            timeouts.ReadIntervalTimeout = MAXDWORD;
+            timeouts.ReadTotalTimeoutConstant = 20;
+            timeouts.ReadTotalTimeoutMultiplier = MAXDWORD;
+            timeouts.WriteTotalTimeoutConstant = 1000;
+            if (!SetCommTimeouts(handle_, &timeouts)) throw Error("SetCommTimeouts failed");
+            PurgeComm(handle_, PURGE_RXCLEAR | PURGE_TXCLEAR);
+        } catch (...) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+            throw;
+        }
     }
 
     ~SerialPort() {
@@ -123,15 +149,25 @@ public:
     }
 
     void write(const std::vector<uint8_t>& frame) {
+        auto& io = write_io_;
+        io.reset();
         DWORD written = 0;
-        if (!WriteFile(handle_, frame.data(), DWORD(frame.size()), &written, nullptr) || written != frame.size())
+        BOOL complete = WriteFile(handle_, frame.data(), DWORD(frame.size()), &written, &io.operation);
+        if (!complete && GetLastError() == ERROR_IO_PENDING)
+            complete = GetOverlappedResult(handle_, &io.operation, &written, TRUE);
+        if (!complete || written != frame.size())
             throw Error("serial write failed");
     }
 
     // Returns 0 on timeout, -1 on failure.
     int read(uint8_t* dest, int capacity) {
+        auto& io = read_io_;
+        io.reset();
         DWORD n = 0;
-        if (ReadFile(handle_, dest, DWORD(capacity), &n, nullptr)) return int(n);
+        BOOL complete = ReadFile(handle_, dest, DWORD(capacity), &n, &io.operation);
+        if (!complete && GetLastError() == ERROR_IO_PENDING)
+            complete = GetOverlappedResult(handle_, &io.operation, &n, TRUE);
+        if (complete) return int(n);
 
         const DWORD error = GetLastError();
         // COMMTIMEOUTS often surface as ERROR_TIMEOUT rather than a zero-length read.
@@ -146,6 +182,8 @@ public:
 
 private:
     HANDLE handle_ = INVALID_HANDLE_VALUE;
+    OverlappedOperation read_io_;
+    OverlappedOperation write_io_;
 };
 #else
 class SerialPort {
@@ -290,6 +328,7 @@ struct Device::Impl {
     std::vector<Sub> subs;
     uint64_t next_id = 1;
     uint16_t whoami = 0;
+    Device::TransactionTiming last_timing;
     std::thread reader;
     std::thread events;
 };
@@ -306,6 +345,11 @@ Device::~Device() = default;
 
 uint16_t Device::who_am_i() const { return impl_->whoami; }
 
+Device::TransactionTiming Device::last_transaction_timing() const {
+    std::lock_guard lock(impl_->mu);
+    return impl_->last_timing;
+}
+
 RawMessage Device::transact(MessageType type, uint8_t address, PayloadType payload_type, const void* data, size_t size) {
     auto frame = build_frame(type, address, payload_type, data, size);
     {
@@ -314,6 +358,7 @@ RawMessage Device::transact(MessageType type, uint8_t address, PayloadType paylo
         if (impl_->pending) throw Error("a request is already in flight");
         impl_->pending = Impl::Pending{address, type};
     }
+    const auto write_started = std::chrono::steady_clock::now();
     try {
         impl_->serial.write(frame);
     } catch (...) {
@@ -321,6 +366,7 @@ RawMessage Device::transact(MessageType type, uint8_t address, PayloadType paylo
         impl_->pending.reset();
         throw;
     }
+    const auto write_finished = std::chrono::steady_clock::now();
 
     std::unique_lock lock(impl_->mu);
     if (!impl_->cv.wait_for(lock, kReplyTimeout, [&] { return (impl_->pending && impl_->pending->ready) || impl_->fault; })) {
@@ -331,6 +377,10 @@ RawMessage Device::transact(MessageType type, uint8_t address, PayloadType paylo
     RawMessage msg = std::move(impl_->pending->message);
     impl_->pending.reset();
     if (msg.error) throw Error("device returned an error for register " + std::to_string(address));
+    impl_->last_timing = {
+        std::chrono::duration<double, std::milli>(write_finished - write_started).count(),
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - write_finished).count()
+    };
     return msg;
 }
 

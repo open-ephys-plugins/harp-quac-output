@@ -6,6 +6,7 @@
 
 #include "quac.hpp"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -298,10 +299,12 @@ private:
         std::string port;
         std::vector<QuacWave> waves;
         bool loop = false;
+        std::chrono::steady_clock::time_point queuedAt = std::chrono::steady_clock::now();
     };
 
     void post (Job job)
     {
+        job.queuedAt = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock (mutex);
             jobs.push_back (std::move (job));
@@ -309,12 +312,13 @@ private:
         cv.notify_all();
     }
 
-    static void closeDevice (std::unique_ptr<quac::Device>& device,
-                             harp::Device::Subscription& subscription,
-                             std::string& openPort,
-                             uint8_t& loopMask)
+    void closeDevice (std::unique_ptr<quac::Device>& device,
+                      harp::Device::Subscription& subscription,
+                      std::string& openPort,
+                      uint8_t& loopMask)
     {
         loopMask = 0;
+        prepared = {};
         if (device != nullptr)
         {
             try
@@ -343,15 +347,62 @@ private:
         return false;
     }
 
-    static bool startWave (quac::Device& device, const QuacWave& wave, bool loop, const std::atomic<int>& epoch, int token)
+    static double elapsedMs (std::chrono::steady_clock::time_point start)
+    {
+        return std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - start).count();
+    }
+
+    static void logTransaction (quac::Device& device, uint8_t address)
+    {
+        const auto timing = device.last_transaction_timing();
+        LOGD ("Harp Quac register ", (int) address, ": write=", timing.write_ms,
+              " ms, reply wait=", timing.reply_ms, " ms");
+    }
+
+    struct PreparedWave
+    {
+        quac::PlayerType player;
+        uint8_t settingsAddress;
+        std::vector<uint8_t> payload;
+    };
+
+    template <typename Settings>
+    bool prepareWave (quac::Device& device, int channel, quac::PlayerType player,
+                      harp::Register<Settings> reg, const Settings& settings)
+    {
+        static_assert (std::is_trivially_copyable_v<Settings>);
+        const auto* bytes = reinterpret_cast<const uint8_t*> (&settings);
+        const std::vector<uint8_t> payload (bytes, bytes + sizeof (settings));
+        const auto& previous = prepared[channel];
+        if (previous && previous->player == player
+            && previous->settingsAddress == reg.address && previous->payload == payload)
+            return false;
+
+        // An inactive player's settings can be written before selecting it.
+        // If the player is unchanged, writing settings alone rearms it.
+        const bool selectPlayer = ! previous || previous->player != player;
+        prepared[channel].reset();
+        device.write (reg, settings);
+        logTransaction (device, reg.address);
+        if (selectPlayer)
+        {
+            device.write (kPlayers[channel], player);
+            logTransaction (device, kPlayers[channel].address);
+        }
+        prepared[channel] = PreparedWave { player, reg.address, payload };
+        return true;
+    }
+
+    bool startWave (quac::Device& device, const QuacWave& wave, bool loop, const std::atomic<int>& epoch, int token)
     {
         const int channel = jlimit (0, 3, wave.channel);
         const auto mask = channelMask (channel);
         const uint8_t bits = uint8_t (mask);
+        const auto prepareStarted = std::chrono::steady_clock::now();
+        bool changed = false;
 
         if (wave.type == PatternType::sine)
         {
-            device.write (kPlayers[channel], quac::PlayerType::Sine);
             quac::SineSettings settings;
             settings.cycles = (uint32_t) wave.cycles;
             settings.frequency = (uint32_t) jmax (1, wave.frequency);
@@ -367,7 +418,7 @@ private:
                 const double microseconds = double (settings.cycles) / double (settings.frequency) * 1.0e6;
                 settings.duration = microseconds > double (UINT32_MAX) ? UINT32_MAX : (uint32_t) microseconds;
             }
-            device.write (kSine[channel], settings);
+            changed = prepareWave (device, channel, quac::PlayerType::Sine, kSine[channel], settings);
         }
         else if (wave.type == PatternType::custom)
         {
@@ -377,17 +428,15 @@ private:
                 return false;
             }
 
-            device.write (kPlayers[channel], quac::PlayerType::File);
             quac::FileSettings settings;
             settings.cycles = 1;
             settings.duration = 0;
             settings.update_frequency = 500000;
             settings.set_path (wave.path);
-            device.write (kFiles[channel], settings);
+            changed = prepareWave (device, channel, quac::PlayerType::File, kFiles[channel], settings);
         }
         else
         {
-            device.write (kPlayers[channel], quac::PlayerType::Trapezoid);
             const int onMs = jmax (0, wave.onMs);
             const int offMs = jmax (0, wave.offMs);
             const int rampOn = jmax (0, wave.rampOnMs);
@@ -404,17 +453,31 @@ private:
             settings.pulse_width_duration = usFromMs (jmax (0, onMs - rampOn - rampOff));
             settings.ramp_off_duration = usFromMs (rampOff);
             settings.duration = loop ? 0 : usFromMs (int64 (settings.cycles) * periodMs);
-            device.write (kTrapezoid[channel], settings);
+            changed = prepareWave (device, channel, quac::PlayerType::Trapezoid, kTrapezoid[channel], settings);
         }
+        const double prepareMs = elapsedMs (prepareStarted);
+        const auto readyStarted = std::chrono::steady_clock::now();
 
         if (! waitReady (device, bits, epoch, token))
         {
+            prepared[channel].reset();
             if (epoch.load() == token)
                 LOGE ("Harp Quac: AO", channel, " did not become ready.");
             return false;
         }
+        const double readyMs = elapsedMs (readyStarted);
+        logTransaction (device, quac::DacReady.address);
+        // Stop may have arrived while the readiness transaction was pending.
+        if (epoch.load() != token)
+            return false;
+        const auto startSent = std::chrono::steady_clock::now();
 
         device.write (quac::DacStart, mask);
+        const double startMs = elapsedMs (startSent);
+        logTransaction (device, quac::DacStart.address);
+        LOGD ("Harp Quac AO", channel, ": ", changed ? "configured" : "cached",
+              ", prepare=", prepareMs, " ms, ready=", readyMs,
+              " ms, start/ack=", startMs, " ms (host timing, not output onset)");
         return true;
     }
 
@@ -469,6 +532,8 @@ private:
 
             if (haveJob)
             {
+                if (job.type == Job::Play)
+                    LOGD ("Harp Quac play queue wait=", elapsedMs (job.queuedAt), " ms");
                 try
                 {
                     if (job.type == Job::Port)
@@ -479,6 +544,7 @@ private:
                     else if (job.type == Job::Stop)
                     {
                         loopMask = 0;
+                        prepared = {};
                         if (device != nullptr)
                             device->write (quac::DacAbort, quac::AnalogOutputs (0x0F));
                     }
@@ -552,12 +618,15 @@ private:
                 }
                 catch (const std::exception& error)
                 {
+                    prepared = {};
                     LOGE ("Harp Quac retrigger: ", error.what());
                 }
             }
         }
     }
 
+    // Accessed only by the hardware worker. Disconnect/abort invalidates all.
+    std::array<std::optional<PreparedWave>, kNumAoChannels> prepared;
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<Job> jobs;
