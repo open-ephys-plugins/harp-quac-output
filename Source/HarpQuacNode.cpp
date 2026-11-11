@@ -404,7 +404,8 @@ private:
         if (wave.type == PatternType::sine)
         {
             quac::SineSettings settings;
-            settings.cycles = (uint32_t) wave.cycles;
+            // Device cycles repeat the entire duration, not individual periods.
+            settings.cycles = 1;
             settings.frequency = (uint32_t) jmax (1, wave.frequency);
             settings.update_frequency = 10000;
             unipolarLevels (wave.sineVoltage, settings.amplitude, settings.vertical_shift);
@@ -415,7 +416,7 @@ private:
             }
             else
             {
-                const double microseconds = double (settings.cycles) / double (settings.frequency) * 1.0e6;
+                const double microseconds = double (jmax (1, wave.cycles)) / double (settings.frequency) * 1.0e6;
                 settings.duration = microseconds > double (UINT32_MAX) ? UINT32_MAX : (uint32_t) microseconds;
             }
             changed = prepareWave (device, channel, quac::PlayerType::Sine, kSine[channel], settings);
@@ -444,7 +445,8 @@ private:
             const int periodMs = jmax (1, onMs + offMs);
 
             quac::TrapezoidSettings settings;
-            settings.cycles = (uint32_t) jmax (1, wave.repeats);
+            // The duration already includes every requested pulse.
+            settings.cycles = 1;
             settings.frequency = (uint32_t) jmax (1, (int) std::lround (1000.0 / periodMs));
             settings.update_frequency = 10000;
             unipolarLevels (wave.pulseVoltage, settings.amplitude, settings.vertical_shift);
@@ -452,7 +454,7 @@ private:
             settings.ramp_on_duration = usFromMs (rampOn);
             settings.pulse_width_duration = usFromMs (jmax (0, onMs - rampOn - rampOff));
             settings.ramp_off_duration = usFromMs (rampOff);
-            settings.duration = loop ? 0 : usFromMs (int64 (settings.cycles) * periodMs);
+            settings.duration = loop ? 0 : usFromMs (int64 (jmax (1, wave.repeats)) * periodMs);
             changed = prepareWave (device, channel, quac::PlayerType::Trapezoid, kTrapezoid[channel], settings);
         }
         const double prepareMs = elapsedMs (prepareStarted);
